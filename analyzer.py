@@ -113,18 +113,26 @@ JSON_SCHEMA = {
 
 def analyze(market: dict, api_key: str, timeout: int = 60) -> Optional[dict]:
     title = market.get("title") or market.get("ticker")
+    rules_primary = (market.get("rules_primary") or "").strip()
+    rules_secondary = (market.get("rules_secondary") or "").strip()
+    rules_block = f"Resolution rule: {rules_primary}"
+    if rules_secondary:
+        rules_block += f"\nAdditional rules: {rules_secondary}"
+
     user_prompt = (
         f"Kalshi market: {title}\n"
         f"Category: {market.get('category', '?')}\n"
         f"Detail: {market.get('subtitle') or ''}\n"
         f"YES means: {market.get('yes_sub_title') or ''}\n"
+        f"{rules_block}\n"
         f"Current YES price: {market.get('last_price')}c "
         f"(= {market.get('last_price')}% implied)\n"
         f"24h volume: {market.get('volume_24h')} contracts | "
         f"open interest: {market.get('open_interest')}\n"
         f"Closes (UTC): {market.get('close_time')}\n"
         f"Ticker: {market.get('ticker')}\n\n"
-        f"Decide if mispriced. Be skeptical."
+        f"Use the Resolution rule as the precise question. Decide if "
+        f"mispriced. Be skeptical."
     )
 
     body = {
