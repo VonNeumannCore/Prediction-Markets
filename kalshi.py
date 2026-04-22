@@ -50,11 +50,11 @@ def _normalize(m: dict) -> dict:
     return m
 
 
-def fetch_event_categories(max_pages: int = 30) -> dict[str, str]:
-    """Map event_ticker -> category for all currently-open events."""
-    out: dict[str, str] = {}
+def fetch_event_meta(max_pages: int = 50) -> dict[str, dict]:
+    """Map event_ticker -> {category, series_ticker} for open events."""
+    out: dict[str, dict] = {}
     cursor: str | None = None
-    for page in range(1, max_pages + 1):
+    for _ in range(max_pages):
         params: dict = {"limit": 200, "status": "open"}
         if cursor:
             params["cursor"] = cursor
@@ -62,12 +62,15 @@ def fetch_event_categories(max_pages: int = 30) -> dict[str, str]:
         for e in data.get("events", []):
             t = e.get("event_ticker")
             if t:
-                out[t] = e.get("category", "")
+                out[t] = {
+                    "category": e.get("category", ""),
+                    "series_ticker": e.get("series_ticker", ""),
+                }
         cursor = data.get("cursor") or None
         if not cursor:
             break
         time.sleep(0.3)
-    print(f"  cached categories for {len(out)} events")
+    print(f"  cached meta for {len(out)} events")
     return out
 
 
@@ -75,15 +78,14 @@ def fetch_markets_closing_within(
     days: int,
     page_limit: int = 1000,
     max_pages: int = 60,
-    stale_pages_stop: int = 20,
 ) -> list[dict]:
     """Open markets closing within the next `days` days. Drops parlays
-    and provisional (just-listed, no-trading-yet) markets."""
+    and provisional (just-listed, no-trading-yet) markets. Walks all
+    pages within the date window up to `max_pages` (safety cap)."""
     now = datetime.now(timezone.utc)
     horizon = now + timedelta(days=days)
     out: list[dict] = []
     cursor: str | None = None
-    stale = 0
     for page in range(1, max_pages + 1):
         params: dict = {
             "limit": page_limit,
@@ -101,33 +103,30 @@ def fetch_markets_closing_within(
             if any(m.get("ticker", "").startswith(p) for p in EXCLUDE_TICKER_PREFIXES):
                 continue
             out.append(_normalize(m))
-        added = len(out) - before
         cursor = data.get("cursor") or None
-        print(f"  page {page}: +{added} (total {len(out)})")
+        added = len(out) - before
+        if added or page % 10 == 0:
+            print(f"  page {page}: +{added} (total {len(out)})")
         if not cursor:
             break
-        if added == 0:
-            stale += 1
-            if stale >= stale_pages_stop and out:
-                print(f"  early-exit: {stale} consecutive empty pages")
-                break
-        else:
-            stale = 0
         time.sleep(0.3)
     return out
 
 
 def filter_by_category(
     markets: Iterable[dict],
-    category_by_event: dict[str, str],
+    event_meta: dict[str, dict],
     allowed: set[str],
 ) -> list[dict]:
-    """Keep only markets whose parent event is in an allowed category."""
+    """Keep only markets whose parent event is in an allowed category.
+    Also enriches each market with its category and series_ticker."""
     out = []
     for m in markets:
-        cat = category_by_event.get(m.get("event_ticker", ""), "")
+        meta = event_meta.get(m.get("event_ticker", ""), {})
+        cat = meta.get("category", "")
         if cat in allowed:
             m["category"] = cat
+            m["series_ticker"] = meta.get("series_ticker", "")
             out.append(m)
     return out
 

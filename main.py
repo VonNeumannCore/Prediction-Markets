@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 from analyzer import analyze
 from kalshi import (
-    fetch_event_categories,
+    fetch_event_meta,
     fetch_markets_closing_within,
     filter_by_category,
     filter_tradeable,
@@ -27,7 +27,8 @@ from notifier import format_alert, send
 
 MAX_DAYS_TO_CLOSE = 3
 CONFIDENCE_THRESHOLD = 75
-ANALYZE_LIMIT = 25
+ANALYZE_LIMIT = 30
+SPORTS_BUDGET = 10  # max sports markets to analyze; remainder for non-sports
 
 ALLOWED_CATEGORIES = {
     "Politics",
@@ -36,7 +37,21 @@ ALLOWED_CATEGORIES = {
     "Health",
     "Science and Technology",
     "World",
+    "Sports",
 }
+
+
+def _select_candidates(tradeable: list[dict]) -> list[dict]:
+    """Take all non-sports first (where LLM has structural edge), then top
+    sports by volume up to SPORTS_BUDGET, capped at ANALYZE_LIMIT."""
+    non_sports = [m for m in tradeable if m.get("category") != "Sports"]
+    sports = [m for m in tradeable if m.get("category") == "Sports"]
+    non_sports.sort(key=lambda m: m.get("volume_24h", 0), reverse=True)
+    sports.sort(key=lambda m: m.get("volume_24h", 0), reverse=True)
+    picked = non_sports[: ANALYZE_LIMIT - SPORTS_BUDGET]
+    remaining = ANALYZE_LIMIT - len(picked)
+    picked += sports[: min(SPORTS_BUDGET, remaining)]
+    return picked
 
 
 def main() -> int:
@@ -45,20 +60,21 @@ def main() -> int:
     tg_token = os.environ["TELEGRAM_BOT_TOKEN"]
     tg_chat = os.environ["TELEGRAM_CHAT_ID"]
 
-    print("Caching event categories...")
-    cat_by_event = fetch_event_categories()
+    print("Caching event meta...")
+    event_meta = fetch_event_meta()
 
     print(f"Fetching markets closing within {MAX_DAYS_TO_CLOSE} days...")
     markets = fetch_markets_closing_within(MAX_DAYS_TO_CLOSE)
     print(f"  got {len(markets)} short-dated open markets")
 
-    in_scope = filter_by_category(markets, cat_by_event, ALLOWED_CATEGORIES)
-    print(f"  {len(in_scope)} are in allowed categories: {sorted(ALLOWED_CATEGORIES)}")
+    in_scope = filter_by_category(markets, event_meta, ALLOWED_CATEGORIES)
+    print(f"  {len(in_scope)} in allowed categories: {sorted(ALLOWED_CATEGORIES)}")
 
-    candidates = filter_tradeable(in_scope)
-    candidates.sort(key=lambda m: m.get("volume_24h", 0), reverse=True)
-    candidates = candidates[:ANALYZE_LIMIT]
-    print(f"  {len(candidates)} pass tradeability filter (analyzing top by volume)")
+    tradeable = filter_tradeable(in_scope)
+    candidates = _select_candidates(tradeable)
+    n_non_sports = sum(1 for m in candidates if m.get("category") != "Sports")
+    print(f"  {len(tradeable)} tradeable, analyzing {len(candidates)} "
+          f"({n_non_sports} non-sports + {len(candidates) - n_non_sports} sports)")
 
     sent = 0
     for m in candidates:

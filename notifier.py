@@ -17,6 +17,15 @@ def _esc(s) -> str:
     return "".join(out)
 
 
+def _kalshi_url(market: dict) -> str | None:
+    """Best-effort link to the Kalshi page. Series-level URL is reliable;
+    deep-linking to the exact event would require scraping their slugs."""
+    series = (market.get("series_ticker") or "").lower()
+    if series:
+        return f"https://kalshi.com/markets/{series}"
+    return None
+
+
 def format_alert(market: dict, analysis: dict) -> str:
     title = market.get("title") or market.get("ticker") or "?"
     ticker = market.get("ticker", "?")
@@ -27,10 +36,17 @@ def format_alert(market: dict, analysis: dict) -> str:
     conf = analysis["confidence_pct"]
     reason = analysis["reasoning"]
     close = (market.get("close_time") or "")[:16].replace("T", " ")
+    cat = market.get("category", "")
+
+    header = f"*{_esc(title)}*"
+    kurl = _kalshi_url(market)
+    if kurl:
+        header = f"[{_esc(title)}]({_esc(kurl)})"
+        header = f"*{header}*"
 
     lines = [
-        f"*{_esc(title)}*",
-        f"`{_esc(ticker)}` \u00b7 closes {_esc(close)} UTC",
+        header,
+        f"`{_esc(ticker)}` \u00b7 {_esc(cat)} \u00b7 closes {_esc(close)} UTC",
         "",
         f"Market *{last}c* \u2022 Model *{your_p}%* \u2022 Edge *{edge}pp*",
         f"\u27a4 Bet *{verdict}* \u00b7 confidence *{conf}%*",
