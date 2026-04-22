@@ -23,7 +23,7 @@ from kalshi import (
     filter_by_category,
     filter_tradeable,
 )
-from notifier import format_alert, send
+from notifier import format_alert, format_summary, send
 
 MAX_DAYS_TO_CLOSE = 3
 CONFIDENCE_THRESHOLD = 75
@@ -54,12 +54,26 @@ def _select_candidates(tradeable: list[dict]) -> list[dict]:
     return picked
 
 
+def _score(market: dict, analysis: dict) -> float:
+    """Best-bet score = edge (pp) * confidence (%). Lets a 30pp/60% beat
+    a 5pp/95% on conviction-weighted expected value."""
+    last = market.get("last_price")
+    your_p = analysis.get("your_probability_pct")
+    conf = analysis.get("confidence_pct") or 0
+    if last is None or your_p is None:
+        return 0.0
+    edge = abs(int(your_p) - int(last))
+    return float(edge) * float(conf)
+
+
 def main() -> int:
     load_dotenv()
+    manual = "--manual" in sys.argv
     pplx_key = os.environ["PERPLEXITY_API_KEY"]
     tg_token = os.environ["TELEGRAM_BOT_TOKEN"]
     tg_chat = os.environ["TELEGRAM_CHAT_ID"]
 
+    print(f"Run mode: {'MANUAL (/sup)' if manual else 'cron'}")
     print("Caching event meta...")
     event_meta = fetch_event_meta()
 
@@ -77,12 +91,21 @@ def main() -> int:
           f"({n_non_sports} non-sports + {len(candidates) - n_non_sports} sports)")
 
     sent = 0
+    cost_usd = 0.0
+    best = None  # {"market":..., "analysis":..., "score":...}
+
     for m in candidates:
         print(f"- [{m.get('category')}] {m['ticker']} @ {m.get('last_price')}c "
               f"vol24h={m.get('volume_24h')} oi={m.get('open_interest')}")
         a = analyze(m, pplx_key)
         if not a:
             continue
+        cost_usd += float(a.get("_cost_usd", 0.0))
+
+        score = _score(m, a)
+        if best is None or score > best["score"]:
+            best = {"market": m, "analysis": a, "score": score}
+
         if not a.get("mispriced"):
             print(f"    -> not mispriced (conf {a.get('confidence_pct')}%)")
             continue
@@ -94,7 +117,25 @@ def main() -> int:
         sent += 1
         time.sleep(1)
 
-    print(f"Done. Sent {sent} alert(s).")
+    print(f"Done. Sent {sent} alert(s). Spend ${cost_usd:.4f}")
+
+    # On manual /sup runs, ALWAYS reply with a summary so the user gets
+    # acknowledgement. On cron runs, only summarize if we sent nothing
+    # (so we don't double-message on alert-rich runs).
+    if manual or sent == 0:
+        msg = format_summary(
+            fetched=len(markets),
+            in_scope=len(in_scope),
+            tradeable=len(tradeable),
+            analyzed=len(candidates),
+            alerts_sent=sent,
+            cost_usd=cost_usd,
+            best=best,
+        )
+        # Only push the cron-no-alerts summary when manual; otherwise
+        # we'd spam the user every 6h with "nothing today". Manual = always.
+        if manual:
+            send(tg_token, tg_chat, msg)
     return 0
 
 

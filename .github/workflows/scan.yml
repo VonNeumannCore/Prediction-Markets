@@ -2,7 +2,12 @@ name: scan
 on:
   schedule:
     - cron: '0 */6 * * *'   # every 6h
-  workflow_dispatch:        # manual trigger from Actions tab
+  workflow_dispatch:
+    inputs:
+      manual:
+        description: "Manual run (always reply with summary)"
+        required: false
+        default: "false"
 
 jobs:
   run:
@@ -14,8 +19,14 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - run: python main.py
+      - name: Run scanner
         env:
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event.inputs.manual }}" = "true" ]; then
+            python main.py --manual
+          else
+            python main.py
+          fi

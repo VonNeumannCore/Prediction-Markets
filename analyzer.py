@@ -9,16 +9,30 @@ import requests
 API_URL = "https://api.perplexity.ai/chat/completions"
 MODEL = "sonar-pro"
 
-SYSTEM_PROMPT = """You are a sharp prediction-market analyst. Find Kalshi
-markets where the public has not yet priced in information you can locate
-through web search. A false alert is much worse than a missed one --
-default hard to "not mispriced".
+SYSTEM_PROMPT = """You are a sharp prediction-market analyst.
+
+# Your task
+
+You will be given EXACTLY ONE Kalshi market in the user message, with its
+title, resolution rule, current YES price, and ticker. Your job is to
+evaluate ONLY THAT SPECIFIC MARKET and decide whether the current YES
+price is mispriced relative to publicly available information.
+
+Do NOT search Kalshi or any prediction market for other opportunities.
+Do NOT analyze a different market than the one provided. Treat the
+Resolution rule in the user message as the precise yes/no question to
+answer; ignore similar-sounding but distinct markets.
+
+A false alert is much worse than a missed one -- default hard to
+"not mispriced".
 
 # Process
 
-1. Search the web for primary, recent evidence about the question.
-2. Form your own probability that YES resolves true.
-3. Declare MISPRICED only if ALL are true:
+1. Re-read the Resolution rule in the user message. That is THE question.
+2. Search the web for primary, recent evidence specifically about that
+   resolution criterion (not the broader topic).
+3. Form your own probability that THIS market's YES resolves true.
+4. Declare MISPRICED only if ALL are true:
    a) Edge: your probability differs from the market by >=
         - SPORTS markets: 20 percentage points
         - ALL OTHER markets: 25 percentage points
@@ -39,7 +53,7 @@ default hard to "not mispriced".
       outlets. One source maxes out at confidence 79.
    e) The information is genuinely not yet reflected in the market price.
    f) You can articulate the concrete reason in one sentence.
-4. Pick the side: YES if true is underpriced, NO if overpriced.
+5. Pick the side: YES if true is underpriced, NO if overpriced.
 
 # Source rules (CRITICAL)
 
@@ -140,7 +154,10 @@ def analyze(market: dict, api_key: str, timeout: int = 60) -> Optional[dict]:
         rules_block += f"\nAdditional rules: {rules_secondary}"
 
     user_prompt = (
-        f"Kalshi market: {title}\n"
+        f"Evaluate THIS specific Kalshi market and only this market.\n\n"
+        f"=== MARKET ===\n"
+        f"Title: {title}\n"
+        f"Ticker: {market.get('ticker')}\n"
         f"Category: {market.get('category', '?')}\n"
         f"Detail: {market.get('subtitle') or ''}\n"
         f"YES means: {market.get('yes_sub_title') or ''}\n"
@@ -150,9 +167,12 @@ def analyze(market: dict, api_key: str, timeout: int = 60) -> Optional[dict]:
         f"24h volume: {market.get('volume_24h')} contracts | "
         f"open interest: {market.get('open_interest')}\n"
         f"Closes (UTC): {market.get('close_time')}\n"
-        f"Ticker: {market.get('ticker')}\n\n"
-        f"Use the Resolution rule as the precise question. Decide if "
-        f"mispriced. Be skeptical."
+        f"=== END MARKET ===\n\n"
+        f"The Resolution rule above is the precise yes/no question. "
+        f"Search the web for evidence that bears DIRECTLY on that "
+        f"resolution criterion. Compare your probability against the "
+        f"current YES price ({market.get('last_price')}%). Decide if "
+        f"mispriced per the system rules. Be skeptical."
     )
 
     body = {
@@ -174,8 +194,13 @@ def analyze(market: dict, api_key: str, timeout: int = 60) -> Optional[dict]:
     try:
         r = requests.post(API_URL, json=body, headers=headers, timeout=timeout)
         r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
-        return json.loads(content)
+        payload = r.json()
+        content = payload["choices"][0]["message"]["content"]
+        result = json.loads(content)
+        usage = payload.get("usage") or {}
+        cost = ((usage.get("cost") or {}).get("total_cost")) or 0.0
+        result["_cost_usd"] = float(cost)
+        return result
     except Exception as e:
         print(f"  ! perplexity error for {market.get('ticker')}: {e}")
         return None

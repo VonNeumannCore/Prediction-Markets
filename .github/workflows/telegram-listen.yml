@@ -1,0 +1,53 @@
+name: telegram-listen
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 min (GH Actions min granularity)
+  workflow_dispatch:
+
+permissions:
+  actions: write    # to dispatch scan.yml
+  contents: read
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      GH_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+      REPO:               ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Poll Telegram for /sup and trigger scan if seen
+        shell: bash
+        run: |
+          set -euo pipefail
+          UPDATES=$(curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=0&allowed_updates=%5B%22message%22%5D")
+          export NOW=$(date -u +%s)
+          TRIGGER=$(printf '%s' "$UPDATES" | python3 scripts/parse_updates.py)
+          FIRE=$(echo "$TRIGGER" | awk '{print $1}')
+          MAX_ID=$(echo "$TRIGGER" | awk '{print $2}')
+          echo "fire=$FIRE max_id=$MAX_ID"
+
+          # Ack everything we just read so Telegram drops it from the buffer.
+          if [ "$MAX_ID" != "-1" ]; then
+            NEXT=$((MAX_ID + 1))
+            curl -fsS -o /dev/null "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${NEXT}&timeout=0"
+          fi
+
+          if [ "$FIRE" = "1" ]; then
+            echo "/sup detected -- dispatching scan.yml with manual=true"
+            curl -fsS -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPO}/actions/workflows/scan.yml/dispatches" \
+              -d '{"ref":"main","inputs":{"manual":"true"}}'
+            curl -fsS -o /dev/null -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=Scan started -- results in ~3-5 min."
+          else
+            echo "no /sup in last 10min, nothing to do"
+          fi
