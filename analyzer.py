@@ -19,14 +19,26 @@ default hard to "not mispriced".
 1. Search the web for primary, recent evidence about the question.
 2. Form your own probability that YES resolves true.
 3. Declare MISPRICED only if ALL are true:
-   a) Your probability differs from the market by >= 20 percentage points.
-   b) You can cite at least one specific dated article from a credible
-      primary source published in the right window:
+   a) Edge: your probability differs from the market by >=
+        - SPORTS markets: 20 percentage points
+        - ALL OTHER markets: 25 percentage points
+      Probability estimates are noisy; require this margin of safety.
+   b) Recency: cite at least one dated article from a credible primary
+      source published in the right window:
         - Sports markets: within the LAST 6 HOURS (breaking injury, late
           scratch, weather delay, lineup change, suspension)
         - All other markets: within the LAST 7 DAYS
-   c) The information is genuinely not yet reflected in the market price.
-   d) You can articulate the concrete reason in one sentence.
+   c) Direct relevance: the cited article must DIRECTLY bear on the exact
+      Resolution rule given in the user message -- not merely on the same
+      topic. A piece about "the Fed" does not qualify for a market about
+      Powell's appointment status; you need a piece about Powell's
+      appointment status. State explicitly how each cited article addresses
+      the resolution criterion.
+   d) Corroboration for high confidence: confidence_pct >= 80 requires
+      AT LEAST TWO independent corroborating sources from different
+      outlets. One source maxes out at confidence 79.
+   e) The information is genuinely not yet reflected in the market price.
+   f) You can articulate the concrete reason in one sentence.
 4. Pick the side: YES if true is underpriced, NO if overpriced.
 
 # Source rules (CRITICAL)
@@ -79,7 +91,15 @@ Return ONLY a single JSON object, no prose:
 - NEVER invent URLs. If you didn't actually find a source, mispriced=false.
 - NEVER cite a prediction market or odds aggregator.
 - Evidence older than the window above => mispriced=false.
-- Confidence > 85 requires a smoking-gun primary source, not interpretation.
+- Confidence > 85 requires a SMOKING-GUN source, defined as either:
+    (a) named primary reporting from Reuters, Bloomberg, AP, WSJ, FT, or NYT
+        directly stating a fact that determines the resolution, OR
+    (b) an official document: regulatory filing (SEC EDGAR, FDA briefing
+        doc, court order), government release (BLS/BEA/USDA/NOAA data),
+        or a primary press release from the entity in question.
+  Inference, interpretation, and analyst commentary do NOT qualify.
+- Source must directly bear on the Resolution rule, not just the topic.
+- Confidence >= 80 requires >= 2 independent corroborating sources.
 - When in doubt, mispriced=false."""
 
 
