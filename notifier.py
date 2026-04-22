@@ -30,8 +30,6 @@ def format_alert(market: dict, analysis: dict) -> str:
     title = market.get("title") or market.get("ticker") or "?"
     ticker = market.get("ticker", "?")
     last = market.get("last_price")
-    your_p = analysis["your_probability_pct"]
-    edge = abs(your_p - last) if isinstance(last, int) else "?"
     verdict = analysis["verdict"]
     conf = analysis["confidence_pct"]
     reason = analysis["reasoning"]
@@ -41,14 +39,13 @@ def format_alert(market: dict, analysis: dict) -> str:
     header = f"*{_esc(title)}*"
     kurl = _kalshi_url(market)
     if kurl:
-        header = f"[{_esc(title)}]({_esc(kurl)})"
-        header = f"*{header}*"
+        header = f"*[{_esc(title)}]({_esc(kurl)})*"
 
     lines = [
         header,
         f"`{_esc(ticker)}` \u00b7 {_esc(cat)} \u00b7 closes {_esc(close)} UTC",
         "",
-        f"Market *{last}c* \u2022 Model *{your_p}%* \u2022 Edge *{edge}pp*",
+        f"Market *{last}c*",
         f"\u27a4 Bet *{verdict}* \u00b7 confidence *{conf}%*",
         "",
         f"_{_esc(reason)}_",
