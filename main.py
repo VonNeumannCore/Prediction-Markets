@@ -1,12 +1,17 @@
 """Entry point. Run every 6h via GitHub Actions.
 
-Pipeline:
-  1. Fetch all open events -> {event_ticker: category} cache.
-  2. Fetch markets closing within MAX_DAYS_TO_CLOSE.
-  3. Keep only markets in whitelisted categories (where LLM has edge).
-  4. Apply tradeability filter (medium-thin volume, OI floor, mid-priced).
-  5. Ask Perplexity per candidate with strict prompt.
-  6. Send Telegram alert when mispriced AND confidence >= threshold.
+Pipeline (mentions-only, post v0.2):
+  1. List all open Kalshi events with category=='Mentions' (excluding
+     sports announcer series).
+  2. For each event, fetch nested markets, drop already-resolved (>95c)
+     siblings, and require at least MIN_LIVE_SIBLINGS live words and a
+     close time within MAX_DAYS_MENTIONS days.
+  3. Sort by 24h event volume; analyze top MAX_EVENTS_PER_RUN.
+  4. Per event: one Perplexity call returns ranked mispriced words after
+     server-side gate (edge vs executable side >= 10pp, confidence >= 70).
+  5. For each event with >= 1 surviving edge, send one Telegram alert.
+  6. On manual /sup runs (or cron with zero alerts on manual only), send
+     a short scan-summary recap.
 """
 from __future__ import annotations
 
@@ -16,54 +21,19 @@ import time
 
 from dotenv import load_dotenv
 
-from analyzer import analyze
+from analyzer import analyze_event
 from kalshi import (
-    fetch_event_meta,
-    fetch_markets_closing_within,
-    filter_by_category,
-    filter_tradeable,
+    MIN_LIVE_SIBLINGS,
+    event_volume_24h,
+    event_within_horizon,
+    fetch_event_with_markets,
+    list_mentions_events,
+    live_siblings,
 )
-from notifier import format_alert, format_summary, send
+from notifier import format_mentions_alert, format_run_summary, send
 
-MAX_DAYS_TO_CLOSE = 3
-CONFIDENCE_THRESHOLD = 75
-ANALYZE_LIMIT = 30
-SPORTS_BUDGET = 10  # max sports markets to analyze; remainder for non-sports
-
-ALLOWED_CATEGORIES = {
-    "Politics",
-    "Entertainment",
-    "Companies",
-    "Health",
-    "Science and Technology",
-    "World",
-    "Sports",
-}
-
-
-def _select_candidates(tradeable: list[dict]) -> list[dict]:
-    """Take all non-sports first (where LLM has structural edge), then top
-    sports by volume up to SPORTS_BUDGET, capped at ANALYZE_LIMIT."""
-    non_sports = [m for m in tradeable if m.get("category") != "Sports"]
-    sports = [m for m in tradeable if m.get("category") == "Sports"]
-    non_sports.sort(key=lambda m: m.get("volume_24h", 0), reverse=True)
-    sports.sort(key=lambda m: m.get("volume_24h", 0), reverse=True)
-    picked = non_sports[: ANALYZE_LIMIT - SPORTS_BUDGET]
-    remaining = ANALYZE_LIMIT - len(picked)
-    picked += sports[: min(SPORTS_BUDGET, remaining)]
-    return picked
-
-
-def _score(market: dict, analysis: dict) -> float:
-    """Best-bet score = edge (pp) * confidence (%). Lets a 30pp/60% beat
-    a 5pp/95% on conviction-weighted expected value."""
-    last = market.get("last_price")
-    your_p = analysis.get("your_probability_pct")
-    conf = analysis.get("confidence_pct") or 0
-    if last is None or your_p is None:
-        return 0.0
-    edge = abs(int(your_p) - int(last))
-    return float(edge) * float(conf)
+MAX_DAYS_MENTIONS = 7
+MAX_EVENTS_PER_RUN = 30
 
 
 def main() -> int:
@@ -74,68 +44,91 @@ def main() -> int:
     tg_chat = os.environ["TELEGRAM_CHAT_ID"]
 
     print(f"Run mode: {'MANUAL (/sup)' if manual else 'cron'}")
-    print("Caching event meta...")
-    event_meta = fetch_event_meta()
+    print("Listing mentions events...")
+    events = list_mentions_events()
 
-    print(f"Fetching markets closing within {MAX_DAYS_TO_CLOSE} days...")
-    markets = fetch_markets_closing_within(MAX_DAYS_TO_CLOSE)
-    print(f"  got {len(markets)} short-dated open markets")
+    # Hydrate each event with its sibling markets and apply tradeability
+    # filters at the event level (need enough live siblings, closing soon).
+    print("Hydrating events with nested markets...")
+    candidates: list[tuple[dict, list[dict]]] = []
+    for e in events:
+        try:
+            full = fetch_event_with_markets(e["event_ticker"])
+        except Exception as ex:
+            print(f"  ! failed to fetch {e.get('event_ticker')}: {ex}")
+            continue
+        sibs = live_siblings(full)
+        if len(sibs) < MIN_LIVE_SIBLINGS:
+            continue
+        # Only consider close-times of LIVE siblings; ignore the early-
+        # closed ones whose close_time is now in the past.
+        if not event_within_horizon(sibs, MAX_DAYS_MENTIONS):
+            continue
+        candidates.append((full, sibs))
+        time.sleep(0.2)
 
-    in_scope = filter_by_category(markets, event_meta, ALLOWED_CATEGORIES)
-    print(f"  {len(in_scope)} in allowed categories: {sorted(ALLOWED_CATEGORIES)}")
-
-    tradeable = filter_tradeable(in_scope)
-    candidates = _select_candidates(tradeable)
-    n_non_sports = sum(1 for m in candidates if m.get("category") != "Sports")
-    print(f"  {len(tradeable)} tradeable, analyzing {len(candidates)} "
-          f"({n_non_sports} non-sports + {len(candidates) - n_non_sports} sports)")
+    candidates.sort(
+        key=lambda pair: -event_volume_24h(pair[0].get("markets", [])),
+    )
+    candidates = candidates[:MAX_EVENTS_PER_RUN]
+    print(
+        f"  {len(candidates)} events tradeable "
+        f"(>= {MIN_LIVE_SIBLINGS} live words, closing in "
+        f"{MAX_DAYS_MENTIONS}d), analyzing top {MAX_EVENTS_PER_RUN}"
+    )
 
     sent = 0
+    total_edges = 0
     cost_usd = 0.0
-    best = None  # {"market":..., "analysis":..., "score":...}
+    analyzed = 0
 
-    for m in candidates:
-        print(f"- [{m.get('category')}] {m['ticker']} @ {m.get('last_price')}c "
-              f"vol24h={m.get('volume_24h')} oi={m.get('open_interest')}")
-        a = analyze(m, pplx_key)
-        if not a:
+    for event, sibs in candidates:
+        ev_t = event.get("event_ticker")
+        title = event.get("title", "?")
+        print(f"- {ev_t} | {title} | {len(sibs)} live words")
+        result = analyze_event(event, sibs, pplx_key)
+        if result is None:
             continue
-        cost_usd += float(a.get("_cost_usd", 0.0))
-
-        score = _score(m, a)
-        if best is None or score > best["score"]:
-            best = {"market": m, "analysis": a, "score": score}
-
-        if not a.get("mispriced"):
-            print(f"    -> not mispriced (conf {a.get('confidence_pct')}%)")
+        analyzed += 1
+        cost_usd += float(result.get("_cost_usd", 0.0))
+        edges = result.get("edges") or []
+        if not edges:
+            print(
+                f"    -> no edges "
+                f"(raw {result.get('raw_edge_count', 0)}, post-filter 0)"
+            )
             continue
-        if a.get("confidence_pct", 0) < CONFIDENCE_THRESHOLD:
-            print(f"    -> below threshold (conf {a.get('confidence_pct')}%)")
-            continue
-        print(f"    -> ALERT: bet {a.get('verdict')} @ {a.get('confidence_pct')}%")
-        send(tg_token, tg_chat, format_alert(m, a))
+        print(
+            f"    -> {len(edges)} edge(s); top: "
+            f"{edges[0].get('word')!r} +{edges[0].get('edge_pp')}pp "
+            f"@ conf {edges[0].get('confidence_pct')}%"
+        )
+        send(tg_token, tg_chat, format_mentions_alert(event, result))
         sent += 1
+        total_edges += len(edges)
         time.sleep(1)
 
-    print(f"Done. Sent {sent} alert(s). Spend ${cost_usd:.4f}")
+    print(
+        f"Done. Sent {sent} alert(s) covering {total_edges} mispriced "
+        f"word(s). Spend ${cost_usd:.4f}"
+    )
 
-    # On manual /sup runs, ALWAYS reply with a summary so the user gets
-    # acknowledgement. On cron runs, only summarize if we sent nothing
-    # (so we don't double-message on alert-rich runs).
-    if manual or sent == 0:
-        msg = format_summary(
-            fetched=len(markets),
-            in_scope=len(in_scope),
-            tradeable=len(tradeable),
-            analyzed=len(candidates),
-            alerts_sent=sent,
-            cost_usd=cost_usd,
-            best=best,
+    # On manual /sup runs always reply with a recap so the user gets
+    # acknowledgement. On cron stay silent unless there were no alerts at
+    # all and the user asked us to (we don't, today: cron with zero hits
+    # is a no-op).
+    if manual:
+        send(
+            tg_token,
+            tg_chat,
+            format_run_summary(
+                events_found=len(events),
+                events_analyzed=analyzed,
+                events_with_edges=sent,
+                total_edges=total_edges,
+                cost_usd=cost_usd,
+            ),
         )
-        # Only push the cron-no-alerts summary when manual; otherwise
-        # we'd spam the user every 6h with "nothing today". Manual = always.
-        if manual:
-            send(tg_token, tg_chat, msg)
     return 0
 
 

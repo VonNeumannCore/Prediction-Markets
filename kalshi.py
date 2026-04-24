@@ -1,17 +1,40 @@
-"""Fetch + filter Kalshi markets via the public read-only API (no auth)."""
+"""Fetch + filter Kalshi 'Mentions' events via the public read-only API."""
 from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
 
 import requests
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
-HEADERS = {"User-Agent": "prediction-markets-scanner/0.1"}
+HEADERS = {"User-Agent": "prediction-markets-scanner/0.2"}
 
-# Multivariate sports parlays: noisy, opaque, useless to an LLM analyst.
-EXCLUDE_TICKER_PREFIXES = ("KXMVE",)
+# Sports announcer / play-by-play mentions: an LLM has ~zero edge predicting
+# which words a broadcast crew will use, so we skip these series outright.
+SPORTS_MENTION_SERIES = {
+    "KXNBAMENTION",
+    "KXMLBMENTION",
+    "KXNFLMENTION",
+    "KXNHLMENTION",
+    "KXFIGHTMENTION",
+    "KXSOCCERMENTION",
+    "KXTENNISMENTION",
+    "KXGOLFMENTION",
+}
+
+# Per-word markets early-close to ~99c the moment the subject says the word.
+# Anything above this is effectively resolved -- nothing left to bet.
+MAX_LIVE_LAST_PRICE = 95
+
+# Need at least this many still-bettable words to bother analyzing the event.
+MIN_LIVE_SIBLINGS = 3
+
+
+def _to_float(x, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
 
 
 def _get_with_retry(url: str, params: dict, *, max_retries: int = 6) -> dict:
@@ -34,123 +57,113 @@ def _get_with_retry(url: str, params: dict, *, max_retries: int = 6) -> dict:
     return {}
 
 
-def _to_float(x, default=0.0) -> float:
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return default
-
-
-def _normalize(m: dict) -> dict:
-    """Add canonical numeric fields (cents int + contract count int)."""
+def _normalize_market(m: dict) -> dict:
+    """Add canonical numeric fields. All prices in cents (int 0-100)."""
     m["last_price"] = round(_to_float(m.get("last_price_dollars")) * 100)
+    m["yes_bid"] = round(_to_float(m.get("yes_bid_dollars")) * 100)
+    m["yes_ask"] = round(_to_float(m.get("yes_ask_dollars")) * 100)
+    m["no_bid"] = round(_to_float(m.get("no_bid_dollars")) * 100)
+    m["no_ask"] = round(_to_float(m.get("no_ask_dollars")) * 100)
     m["volume_24h"] = int(_to_float(m.get("volume_24h_fp")))
     m["open_interest"] = int(_to_float(m.get("open_interest_fp")))
-    m["liquidity_dollars_f"] = _to_float(m.get("liquidity_dollars"))
+    # custom_strike.Word is the structured candidate-word field on mentions
+    # markets; fall back to yes_sub_title for any oddly-shaped event.
+    m["word"] = (
+        ((m.get("custom_strike") or {}).get("Word"))
+        or m.get("yes_sub_title")
+        or ""
+    )
     return m
 
 
-def fetch_event_meta(max_pages: int = 50) -> dict[str, dict]:
-    """Map event_ticker -> {category, series_ticker} for open events."""
-    out: dict[str, dict] = {}
+def list_mentions_events(*, max_pages: int = 50) -> list[dict]:
+    """List all open Kalshi events in the 'Mentions' category, excluding
+    sports announcer series. Returns event dicts WITHOUT nested markets."""
+    out: list[dict] = []
     cursor: str | None = None
-    for _ in range(max_pages):
+    for page in range(1, max_pages + 1):
         params: dict = {"limit": 200, "status": "open"}
         if cursor:
             params["cursor"] = cursor
         data = _get_with_retry(f"{BASE}/events", params)
         for e in data.get("events", []):
-            t = e.get("event_ticker")
-            if t:
-                out[t] = {
-                    "category": e.get("category", ""),
-                    "series_ticker": e.get("series_ticker", ""),
-                }
+            if e.get("category") != "Mentions":
+                continue
+            if e.get("series_ticker") in SPORTS_MENTION_SERIES:
+                continue
+            out.append(e)
         cursor = data.get("cursor") or None
         if not cursor:
             break
         time.sleep(0.3)
-    print(f"  cached meta for {len(out)} events")
+    print(f"  found {len(out)} non-sports mentions events")
     return out
 
 
-def fetch_markets_closing_within(
-    days: int,
-    page_limit: int = 1000,
-    max_pages: int = 60,
-) -> list[dict]:
-    """Open markets closing within the next `days` days. Drops parlays
-    and provisional (just-listed, no-trading-yet) markets. Walks all
-    pages within the date window up to `max_pages` (safety cap)."""
+def fetch_event_with_markets(event_ticker: str) -> dict:
+    """Pull a single event with all sibling markets (normalized in place)."""
+    data = _get_with_retry(
+        f"{BASE}/events/{event_ticker}",
+        {"with_nested_markets": "true"},
+    )
+    evt = data.get("event") or {}
+    mkts = [_normalize_market(m) for m in (evt.get("markets") or [])]
+    evt["markets"] = mkts
+    return evt
+
+
+def live_siblings(event: dict) -> list[dict]:
+    """Sibling markets that are still bettable. Drops the already-resolved
+    early-close contracts (last_price > MAX_LIVE_LAST_PRICE) and any market
+    not in an active/open status."""
+    out = []
+    for m in event.get("markets", []):
+        last = m.get("last_price")
+        if last is None or last > MAX_LIVE_LAST_PRICE:
+            continue
+        status = (m.get("status") or "").lower()
+        if status and status not in ("active", "open"):
+            continue
+        out.append(m)
+    return out
+
+
+def soonest_close(markets: list[dict]) -> datetime | None:
+    """Earliest close_time across markets, or None if none parseable."""
+    best: datetime | None = None
+    for m in markets:
+        ct = m.get("close_time")
+        if not ct:
+            continue
+        try:
+            t = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if best is None or t < best:
+            best = t
+    return best
+
+
+def event_within_horizon(markets: list[dict], days: int) -> bool:
+    """True if at least one market closes in the future AND within `days`
+    days from now. The lower-bound check matters because Kalshi rewrites
+    `close_time` to the actual moment a per-word market early-closes when
+    the subject says the word, so already-resolved siblings carry past
+    timestamps that would otherwise spuriously pass the upper bound."""
     now = datetime.now(timezone.utc)
     horizon = now + timedelta(days=days)
-    out: list[dict] = []
-    cursor: str | None = None
-    for page in range(1, max_pages + 1):
-        params: dict = {
-            "limit": page_limit,
-            "status": "open",
-            "min_close_ts": int(now.timestamp()),
-            "max_close_ts": int(horizon.timestamp()),
-        }
-        if cursor:
-            params["cursor"] = cursor
-        data = _get_with_retry(f"{BASE}/markets", params)
-        before = len(out)
-        for m in data.get("markets", []):
-            if m.get("is_provisional"):
-                continue
-            if any(m.get("ticker", "").startswith(p) for p in EXCLUDE_TICKER_PREFIXES):
-                continue
-            out.append(_normalize(m))
-        cursor = data.get("cursor") or None
-        added = len(out) - before
-        if added or page % 10 == 0:
-            print(f"  page {page}: +{added} (total {len(out)})")
-        if not cursor:
-            break
-        time.sleep(0.3)
-    return out
-
-
-def filter_by_category(
-    markets: Iterable[dict],
-    event_meta: dict[str, dict],
-    allowed: set[str],
-) -> list[dict]:
-    """Keep only markets whose parent event is in an allowed category.
-    Also enriches each market with its category and series_ticker."""
-    out = []
     for m in markets:
-        meta = event_meta.get(m.get("event_ticker", ""), {})
-        cat = meta.get("category", "")
-        if cat in allowed:
-            m["category"] = cat
-            m["series_ticker"] = meta.get("series_ticker", "")
-            out.append(m)
-    return out
+        ct = m.get("close_time")
+        if not ct:
+            continue
+        try:
+            t = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if now < t <= horizon:
+            return True
+    return False
 
 
-def filter_tradeable(
-    markets: Iterable[dict],
-    *,
-    volume_band: tuple[int, int] = (100, 5000),
-    min_open_interest: int = 100,
-    price_band: tuple[int, int] = (25, 75),
-) -> list[dict]:
-    """Liquidity/price filter tuned for finding mispricings the crowd
-    hasn't priced in yet (medium-thin volume, mid-priced)."""
-    vlo, vhi = volume_band
-    plo, phi = price_band
-    keep: list[dict] = []
-    for m in markets:
-        v = m.get("volume_24h") or 0
-        if not (vlo <= v <= vhi):
-            continue
-        if (m.get("open_interest") or 0) < min_open_interest:
-            continue
-        last = m.get("last_price")
-        if last is None or not (plo <= last <= phi):
-            continue
-        keep.append(m)
-    return keep
+def event_volume_24h(markets: list[dict]) -> int:
+    return sum(int(m.get("volume_24h") or 0) for m in markets)

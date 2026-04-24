@@ -1,128 +1,121 @@
-"""Format + send a clean Telegram alert."""
+"""Render + send Telegram alerts for Kalshi 'mentions' edges.
+
+Uses Telegram HTML parse mode so the body is essentially plain text -- only
+&, <, > need escaping -- with a single bold header line. This avoids the
+MarkdownV2 escape gymnastics on `.`, `(`, `)`, `$`, `,` etc., which appear
+all over mentions content (URLs, prices, word lists).
+"""
 from __future__ import annotations
 
 import requests
 
-_MD2_SPECIAL = r"_*[]()~`>#+-=|{}.!\\"
+from analyzer import WIDE_SPREAD_CENTS
 
 
 def _esc(s) -> str:
-    """Escape text for Telegram MarkdownV2."""
-    out = []
-    for c in str(s):
-        if c in _MD2_SPECIAL:
-            out.append("\\" + c)
-        else:
-            out.append(c)
-    return "".join(out)
+    """HTML-escape user/model text for Telegram parse_mode=HTML."""
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
-def _kalshi_url(market: dict) -> str | None:
-    """Best-effort link to the Kalshi page. Series-level URL is reliable;
-    deep-linking to the exact event would require scraping their slugs."""
-    series = (market.get("series_ticker") or "").lower()
-    if series:
-        return f"https://kalshi.com/markets/{series}"
-    return None
+def _fmt_close(close_iso: str | None) -> str:
+    if not close_iso:
+        return "?"
+    return close_iso[:16].replace("T", " ") + " UTC"
 
 
-def format_alert(market: dict, analysis: dict) -> str:
-    title = market.get("title") or market.get("ticker") or "?"
-    ticker = market.get("ticker", "?")
-    last = market.get("last_price")
-    verdict = analysis["verdict"]
-    conf = analysis["confidence_pct"]
-    reason = analysis["reasoning"]
-    close = (market.get("close_time") or "")[:16].replace("T", " ")
-    cat = market.get("category", "")
+def _fmt_implied(last: int, executable: int, spread: int) -> str:
+    """'42%' when spread is tight, '34% (executable: 49%)' when wide."""
+    if spread > WIDE_SPREAD_CENTS and executable != last:
+        return f"{last}% (executable: {executable}%)"
+    return f"{last}%"
 
-    header = f"*{_esc(title)}*"
-    kurl = _kalshi_url(market)
-    if kurl:
-        header = f"*[{_esc(title)}]({_esc(kurl)})*"
 
-    lines = [
-        header,
-        f"`{_esc(ticker)}` \u00b7 {_esc(cat)} \u00b7 closes {_esc(close)} UTC",
-        "",
-        f"Market *{last}c*",
-        f"\u27a4 Bet *{verdict}* \u00b7 confidence *{conf}%*",
-        "",
-        f"_{_esc(reason)}_",
-    ]
-    sources = analysis.get("sources") or []
-    if sources:
-        lines.append("")
-        for i, s in enumerate(sources[:3], 1):
-            t = _esc(s.get("title", "source"))
-            u = s.get("url", "")
-            lines.append(f"{i}\\. [{t}]({_esc(u)})")
+def format_mentions_alert(event: dict, analysis: dict) -> str:
+    """One Telegram message for one event with >= 1 surviving edge."""
+    title = event.get("title", "?")
+    ev_ticker = event.get("event_ticker", "?")
+    siblings = event.get("markets", [])
+    sample = siblings[0] if siblings else {}
+    expiry = _fmt_close(sample.get("close_time"))
+    brief = analysis.get("event_brief") or ""
+    edges = analysis.get("edges") or []
+    cost = float(analysis.get("_cost_usd") or 0.0)
+    model = analysis.get("_model") or "?"
+
+    lines: list[str] = []
+    # Single bold header line, body otherwise plain text.
+    lines.append(f"<b>MARKET: {_esc(title)}</b>")
+    lines.append(f"TICKER: {_esc(ev_ticker)}")
+    lines.append(f"EVENT EXPIRY: {_esc(expiry)}")
+    lines.append("")
+    lines.append("EVENT BRIEF:")
+    lines.append(_esc(brief))
+    lines.append("")
+
+    if not edges:
+        lines.append("NO_EDGE_FOUND")
+    else:
+        lines.append("TOP MISPRICED WORDS:")
+        for i, e in enumerate(edges, 1):
+            m = e.get("market") or {}
+            implied = _fmt_implied(
+                e.get("last_pct", 0),
+                e.get("executable_pct", 0),
+                e.get("spread", 0),
+            )
+            ev_url = (e.get("evidence_url") or "").strip()
+            lines.append(f"{i}. Word: {_esc(e.get('word', '?'))}")
+            lines.append(f"   Ticker: {_esc(e.get('ticker', '?'))}")
+            lines.append(f"   Expires: {_esc(_fmt_close(m.get('close_time')))}")
+            lines.append(f"   Market implied probability: {_esc(implied)}")
+            lines.append(
+                f"   Perplexity estimated probability: "
+                f"{int(e.get('model_pct_side', 0))}%"
+            )
+            lines.append(
+                f"   Difference: {int(e.get('edge_pp', 0))} percentage "
+                f"points (vs executable)"
+            )
+            lines.append(f"   Suggested side: {_esc(e.get('side', '?'))}")
+            lines.append(f"   Confidence: {int(e.get('confidence_pct', 0))}%")
+            lines.append(f"   Reason: {_esc(e.get('reason', ''))}")
+            if ev_url:
+                lines.append(f"   Evidence: {_esc(ev_url)}")
+            lines.append("")
+
+    lines.append(f"MODEL COST: ${cost:.4f}")
+    lines.append(f"MODEL: {_esc(model)}")
     return "\n".join(lines)
 
 
-def format_summary(
+def format_run_summary(
     *,
-    fetched: int,
-    in_scope: int,
-    tradeable: int,
-    analyzed: int,
-    alerts_sent: int,
+    events_found: int,
+    events_analyzed: int,
+    events_with_edges: int,
+    total_edges: int,
     cost_usd: float,
-    best: dict | None,
 ) -> str:
-    """Summary message for /sup runs (or any time we want a recap).
-
-    `best` is a dict like:
-      {
-        "market": <kalshi market dict>,
-        "analysis": <analyzer result dict>,
-        "score": <float>,
-      }
-    """
+    """One short message for manual /sup runs (or any time we want a recap)."""
     lines = [
-        "*Prediction Markets scan*",
+        "<b>Kalshi mentions scan</b>",
         (
-            f"Fetched *{fetched}* \u00b7 in scope *{in_scope}* \u00b7 "
-            f"tradeable *{tradeable}* \u00b7 analyzed *{analyzed}*"
+            f"Events found: {events_found}  |  analyzed: {events_analyzed}  "
+            f"|  with edges: {events_with_edges}"
         ),
-        f"Alerts sent: *{alerts_sent}*",
-        f"Perplexity spend this run: *${_esc(f'{cost_usd:.4f}')}*",
+        f"Total mispriced words alerted: {total_edges}",
+        f"Perplexity spend this run: ${cost_usd:.4f}",
     ]
-    if alerts_sent == 0:
-        if best:
-            m = best["market"]
-            a = best["analysis"]
-            title = m.get("title") or m.get("ticker") or "?"
-            ticker = m.get("ticker", "?")
-            last = m.get("last_price")
-            verdict = a.get("verdict", "?")
-            conf = a.get("confidence_pct", 0)
-            your_p = a.get("your_probability_pct", 0)
-            edge = abs(int(your_p) - int(last)) if last is not None else 0
-            reason = a.get("reasoning", "")
-            kurl = _kalshi_url(m)
-            head = f"*{_esc(title)}*"
-            if kurl:
-                head = f"*[{_esc(title)}]({_esc(kurl)})*"
-            lines += [
-                "",
-                "_No bets crossed threshold\\. Best candidate from this lot:_",
-                head,
-                f"`{_esc(ticker)}` \u00b7 market *{last}c* \u00b7 model *{your_p}%* "
-                f"\u00b7 edge *{edge}pp* \u00b7 conf *{conf}%*",
-                f"\u27a4 Lean *{verdict}*",
-                "",
-                f"_{_esc(reason)}_",
-            ]
-            sources = a.get("sources") or []
-            if sources:
-                lines.append("")
-                for i, s in enumerate(sources[:3], 1):
-                    t = _esc(s.get("title", "source"))
-                    u = s.get("url", "")
-                    lines.append(f"{i}\\. [{t}]({_esc(u)})")
-        else:
-            lines += ["", "_No analyzable candidates this run\\._"]
+    if events_with_edges == 0:
+        lines.append("")
+        lines.append(
+            f"NO_EDGE_FOUND across {events_analyzed} mentions events."
+        )
     return "\n".join(lines)
 
 
@@ -133,7 +126,7 @@ def send(token: str, chat_id: str, text: str) -> None:
         data={
             "chat_id": chat_id,
             "text": text,
-            "parse_mode": "MarkdownV2",
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         },
         timeout=30,

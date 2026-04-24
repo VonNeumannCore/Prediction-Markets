@@ -1,4 +1,9 @@
-"""Ask Perplexity sonar-pro whether a Kalshi market is mispriced."""
+"""Per-event Kalshi 'mentions' analysis via Perplexity sonar-pro.
+
+Sends ONE event (with its full live word table) per Perplexity call and
+returns a JSON object {event_brief, edges} where each edge is a single
+mispriced word the model believes is over- or under-priced by the crowd.
+"""
 from __future__ import annotations
 
 import json
@@ -9,177 +14,278 @@ import requests
 API_URL = "https://api.perplexity.ai/chat/completions"
 MODEL = "sonar-pro"
 
-SYSTEM_PROMPT = """You are a sharp prediction-market analyst.
+EDGE_THRESHOLD_PP = 10
+CONFIDENCE_THRESHOLD = 70
+MAX_EDGES_PER_EVENT = 5
+WIDE_SPREAD_CENTS = 5  # only show "executable" side when spread > this
 
-# Your task
 
-You will be given EXACTLY ONE Kalshi market in the user message, with its
-title, resolution rule, current YES price, and ticker. Your job is to
-evaluate ONLY THAT SPECIFIC MARKET and decide whether the current YES
-price is mispriced relative to publicly available information.
+SYSTEM_PROMPT = """You are a careful prediction-market analyst working on
+Kalshi "mentions" markets. Each market in this category resolves YES if a
+specific person (or entity) says a specific word/phrase during a defined
+upcoming appearance, interview, or address. You are given EXACTLY ONE event
+in the user message and must rank which of its candidate words are mispriced
+relative to publicly available information.
 
-Do NOT search Kalshi or any prediction market for other opportunities.
-Do NOT analyze a different market than the one provided. Treat the
-Resolution rule in the user message as the precise yes/no question to
-answer; ignore similar-sounding but distinct markets.
+# What you receive
 
-A false alert is much worse than a missed one -- default hard to
-"not mispriced".
+For one event:
+- Event title, ticker, expiry, settlement rules text.
+- A description of the upcoming appearance / interview / address.
+- A table of LIVE candidate words/phrases (already-resolved early-close
+  contracts have been filtered out). Each row has:
+    - per-word ticker
+    - YES last_price (cents = market-implied probability %)
+    - YES bid / ask (cents) and NO ask (cents)
+    - 24h volume and open interest
 
 # Process
 
-1. Re-read the Resolution rule in the user message. That is THE question.
-2. Search the web for primary, recent evidence specifically about that
-   resolution criterion (not the broader topic).
-3. Form your own probability that THIS market's YES resolves true.
-4. Declare MISPRICED only if ALL are true:
-   a) Edge: your probability differs from the market by >=
-        - SPORTS markets: 20 percentage points
-        - ALL OTHER markets: 25 percentage points
-      Probability estimates are noisy; require this margin of safety.
-   b) Recency: cite at least one dated article from a credible primary
-      source published in the right window:
-        - Sports markets: within the LAST 6 HOURS (breaking injury, late
-          scratch, weather delay, lineup change, suspension)
-        - All other markets: within the LAST 7 DAYS
-   c) Direct relevance: the cited article must DIRECTLY bear on the exact
-      Resolution rule given in the user message -- not merely on the same
-      topic. A piece about "the Fed" does not qualify for a market about
-      Powell's appointment status; you need a piece about Powell's
-      appointment status. State explicitly how each cited article addresses
-      the resolution criterion.
-   d) Corroboration for high confidence: confidence_pct >= 80 requires
-      AT LEAST TWO independent corroborating sources from different
-      outlets. One source maxes out at confidence 79.
-   e) The information is genuinely not yet reflected in the market price.
-   f) You can articulate the concrete reason in one sentence.
-5. Pick the side: YES if true is underpriced, NO if overpriced.
+1. Identify who the subject is, what they do, and in what capacity they
+   are speaking.
+2. Identify what the upcoming event/interview/address is about. Use the
+   settlement rules to determine which sources/channels count for
+   settlement.
+3. Search the web for similar PUBLIC appearances by the subject in the
+   LAST 7 DAYS, prioritizing appearances that match the same event type
+   or speaking context. For each appearance gather: date, source/outlet,
+   event type/purpose, and direct quote/transcript evidence of whether
+   each candidate word was said.
+4. For each candidate word, estimate the true probability the subject will
+   say that word during the qualifying event. Weigh:
+     - subject's recent language patterns and topical fixations
+     - the purpose of the upcoming event
+     - current news context driving the subject's attention
+     - the named eligible sources for settlement
+     - exactness of the word/phrase requirement (Kalshi treats plurals and
+       possessives as equivalent; OTHER inflections, tense changes,
+       hyphenated compounds, and synonyms do NOT count)
+5. Pick a side for each word: YES if true is underpriced, NO if overpriced.
+6. Compute edge against the EXECUTABLE side, not the last price:
+     - If side == YES: executable_pct = YES ask
+     - If side == NO:  executable_pct = 100 - YES bid (== NO ask)
+   Edge_pp = abs(model_pct_for_chosen_side - executable_pct).
+   For NO bets, model_pct_for_chosen_side = 100 - model_pct_yes.
+7. Return only words where:
+     edge_pp >= 10 percentage points  AND  confidence_pct >= 70
+8. Rank by absolute mispricing (largest edge first). At most 5 edges.
 
-# Source rules (CRITICAL)
+# Hard rules (CRITICAL)
 
-ABSOLUTELY FORBIDDEN as sources -- never cite, never use as evidence:
-  - Other prediction markets: Polymarket, PredictIt, Manifold, Manifold
-    Markets, Kalshi itself, Robinhood prediction markets, Smarkets,
-    Insight Prediction, Betfair Exchange, Augur
-  - Betting odds aggregators: VegasInsider, OddsShark, Action Network,
-    Covers, OddsPortal, Pinnacle odds pages
-  - Speculative blogs, opinion pieces, anonymous X/Twitter posts,
-    Reddit threads (unless they directly quote a primary source you
-    ALSO cite)
+- Do NOT predict YES on a word merely because it is topical. You must
+  cite a recent dated source where the subject said that EXACT word/phrase
+  recently, or show a clear pattern of doing so in this exact event type.
+- ACCEPTABLE evidence sources for prior usage:
+    a) the subject's own Twitter/X or Truth Social posts
+    b) major wires and papers quoting the subject directly: Reuters, AP,
+       Bloomberg, WSJ, FT, NYT, Washington Post, Axios, The Economist
+    c) primary transcripts (C-SPAN, Federal Register, court filings,
+       official press releases, earnings call transcripts, Hansard)
+    d) topic-specialist outlets when they directly quote the subject
+       (Variety/Hollywood Reporter for entertainment; STAT/Endpoints for
+       biotech; ESPN/The Athletic for breaking sports news)
+- ABSOLUTELY FORBIDDEN as evidence -- never cite, never use:
+    - other prediction markets: Polymarket, PredictIt, Manifold, Kalshi
+      itself, Robinhood prediction markets, Smarkets, Insight Prediction
+    - betting aggregators: VegasInsider, OddsShark, Action Network,
+      Pinnacle odds pages
+    - anonymous social posts, opinion blogs, Reddit threads (unless they
+      directly quote a primary source you ALSO cite separately)
+- If you cannot cite a dated source within the last 7 days bearing on
+  the subject's likely use of a word, set that word's confidence_pct < 60
+  (which will exclude it from output).
+- Never invent URLs. If you didn't actually find a source, omit the word
+  rather than fabricating a citation.
+- A false alert is much worse than a missed one. When in doubt, exclude.
 
-ACCEPTABLE sources only:
-  - Major news wires: Reuters, AP, Bloomberg, AFP, WSJ, FT, NYT,
-    Washington Post, The Economist, Axios
-  - Government / official data: BLS, BEA, SEC EDGAR, FDA, USDA, NOAA,
-    Federal Register, court filings, central bank statements
-  - Specialist outlets relevant to the topic, e.g.:
-    - Entertainment: Variety, Hollywood Reporter, Deadline, Billboard
-    - Biotech / Health: STAT News, Endpoints, BioPharma Dive, FDA briefing docs
-    - Sports breaking news: ESPN, The Athletic, official team accounts
-    - Companies: company press releases, 8-K filings, earnings call transcripts
-    - Politics: official campaign sites, government press releases
+# Output format
 
-# Sports-specific rules
+Return ONE JSON object EXACTLY matching the provided schema. No prose
+outside the JSON. Each edge object MUST include:
+  ticker, word, model_pct (int 0..100, the YES-side probability you
+  estimate), side ("YES"|"NO"), confidence_pct (int 0..100),
+  reason (one short sentence naming the dated source), evidence_url
+  (the single best supporting URL, or "" if none).
 
-Vegas, Pinnacle and major sportsbooks price game outcomes, totals,
-spreads, and player props EFFICIENTLY. The ONLY way a sports market is
-mispriced is a specific breaking-news event in the last 6 hours that
-hasn't fully propagated to all books -- e.g. confirmed late scratch,
-weather delay, suspension. Cite the specific named report. Otherwise
-mispriced=false. "Team X looks strong" / "they have a good record" /
-gut feel about a matchup are NOT valid reasons.
-
-# Output
-
-Return ONLY a single JSON object, no prose:
-{
-  "mispriced": bool,
-  "verdict": "YES" | "NO",
-  "your_probability_pct": int 0..100,
-  "confidence_pct": int 0..100,
-  "reasoning": "exactly 3 short sentences: (1) the specific dated evidence, (2) why the market is wrong / what it's missing, (3) how / when it likely resolves",
-  "sources": [ {"title": str, "url": str}, ... up to 3, ranked best-first ]
-}
-
-# Hard rules
-- NEVER invent URLs. If you didn't actually find a source, mispriced=false.
-- NEVER cite a prediction market or odds aggregator.
-- Evidence older than the window above => mispriced=false.
-- Confidence > 85 requires a SMOKING-GUN source, defined as either:
-    (a) named primary reporting from Reuters, Bloomberg, AP, WSJ, FT, or NYT
-        directly stating a fact that determines the resolution, OR
-    (b) an official document: regulatory filing (SEC EDGAR, FDA briefing
-        doc, court order), government release (BLS/BEA/USDA/NOAA data),
-        or a primary press release from the entity in question.
-  Inference, interpretation, and analyst commentary do NOT qualify.
-- Source must directly bear on the Resolution rule, not just the topic.
-- Confidence >= 80 requires >= 2 independent corroborating sources.
-- When in doubt, mispriced=false."""
+If no words clear the threshold, return:
+  {"event_brief": "<2-3 sentences>", "edges": []}
+"""
 
 
 JSON_SCHEMA = {
     "type": "object",
     "properties": {
-        "mispriced": {"type": "boolean"},
-        "verdict": {"type": "string", "enum": ["YES", "NO"]},
-        "your_probability_pct": {"type": "integer", "minimum": 0, "maximum": 100},
-        "confidence_pct": {"type": "integer", "minimum": 0, "maximum": 100},
-        "reasoning": {"type": "string"},
-        "sources": {
+        "event_brief": {"type": "string"},
+        "edges": {
             "type": "array",
-            "maxItems": 3,
+            "maxItems": MAX_EDGES_PER_EVENT,
             "items": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string"},
-                    "url": {"type": "string"},
+                    "ticker": {"type": "string"},
+                    "word": {"type": "string"},
+                    "model_pct": {
+                        "type": "integer", "minimum": 0, "maximum": 100,
+                    },
+                    "side": {"type": "string", "enum": ["YES", "NO"]},
+                    "confidence_pct": {
+                        "type": "integer", "minimum": 0, "maximum": 100,
+                    },
+                    "reason": {"type": "string"},
+                    "evidence_url": {"type": "string"},
                 },
-                "required": ["title", "url"],
+                "required": [
+                    "ticker", "word", "model_pct", "side",
+                    "confidence_pct", "reason", "evidence_url",
+                ],
             },
         },
     },
-    "required": [
-        "mispriced", "verdict", "your_probability_pct",
-        "confidence_pct", "reasoning", "sources",
-    ],
+    "required": ["event_brief", "edges"],
 }
 
 
-def analyze(market: dict, api_key: str, timeout: int = 60) -> Optional[dict]:
-    title = market.get("title") or market.get("ticker")
-    rules_primary = (market.get("rules_primary") or "").strip()
-    rules_secondary = (market.get("rules_secondary") or "").strip()
-    rules_block = f"Resolution rule: {rules_primary}"
-    if rules_secondary:
-        rules_block += f"\nAdditional rules: {rules_secondary}"
+def _build_word_table(siblings: list[dict]) -> str:
+    """Fixed-width table the LLM can read at a glance."""
+    header = (
+        f"{'TICKER':40s}  {'WORD':40s}  "
+        f"{'LAST':>4s}  {'YBID':>4s}  {'YASK':>4s}  {'NASK':>4s}  "
+        f"{'VOL24':>7s}  {'OI':>7s}"
+    )
+    lines = [header, "-" * len(header)]
+    for m in sorted(siblings, key=lambda x: -int(x.get("volume_24h") or 0)):
+        word = (m.get("word") or "")[:40]
+        lines.append(
+            f"{m['ticker']:40s}  {word:40s}  "
+            f"{int(m.get('last_price') or 0):>4d}  "
+            f"{int(m.get('yes_bid') or 0):>4d}  "
+            f"{int(m.get('yes_ask') or 0):>4d}  "
+            f"{int(m.get('no_ask') or 0):>4d}  "
+            f"{int(m.get('volume_24h') or 0):>7d}  "
+            f"{int(m.get('open_interest') or 0):>7d}"
+        )
+    return "\n".join(lines)
 
-    user_prompt = (
-        f"Evaluate THIS specific Kalshi market and only this market.\n\n"
-        f"=== MARKET ===\n"
-        f"Title: {title}\n"
-        f"Ticker: {market.get('ticker')}\n"
-        f"Category: {market.get('category', '?')}\n"
-        f"Detail: {market.get('subtitle') or ''}\n"
-        f"YES means: {market.get('yes_sub_title') or ''}\n"
-        f"{rules_block}\n"
-        f"Current YES price: {market.get('last_price')}c "
-        f"(= {market.get('last_price')}% implied)\n"
-        f"24h volume: {market.get('volume_24h')} contracts | "
-        f"open interest: {market.get('open_interest')}\n"
-        f"Closes (UTC): {market.get('close_time')}\n"
-        f"=== END MARKET ===\n\n"
-        f"The Resolution rule above is the precise yes/no question. "
-        f"Search the web for evidence that bears DIRECTLY on that "
-        f"resolution criterion. Compare your probability against the "
-        f"current YES price ({market.get('last_price')}%). Decide if "
-        f"mispriced per the system rules. Be skeptical."
+
+def _build_user_prompt(event: dict, siblings: list[dict]) -> str:
+    title = event.get("title", "?")
+    ev_ticker = event.get("event_ticker", "?")
+    series = event.get("series_ticker", "")
+    sub_title = event.get("sub_title", "")
+    # rules_secondary is identical across siblings -- one canonical copy.
+    sample = siblings[0] if siblings else {}
+    rules_secondary = (sample.get("rules_secondary") or "").strip()
+    early_close = (sample.get("early_close_condition") or "").strip()
+    expiry = (sample.get("close_time") or "")[:16].replace("T", " ")
+    # Replace the literal candidate word in rules_primary with <WORD> so
+    # the model sees an explicit per-word template, not a rule that
+    # mentions only whichever sibling happened to sort first.
+    rp = (sample.get("rules_primary") or "").strip()
+    sample_word = sample.get("word") or ""
+    if sample_word and sample_word in rp:
+        rules_primary_template = rp.replace(sample_word, "<WORD>")
+    else:
+        rules_primary_template = rp
+
+    return (
+        "EVENT\n=====\n"
+        f"Title:        {title}\n"
+        f"Event ticker: {ev_ticker}\n"
+        f"Series:       {series}\n"
+        f"Sub-title:    {sub_title}\n"
+        f"Expiry (UTC): {expiry}\n\n"
+        "Resolution rule (per-word template, applies to every candidate "
+        "in the table; substitute <WORD> with the candidate word):\n"
+        f"  {rules_primary_template}\n\n"
+        "Settlement source rules (apply to all candidate words):\n"
+        f"  {rules_secondary}\n\n"
+        f"Early-close: {early_close}\n\n"
+        "CANDIDATE WORDS  (already-resolved >95c contracts removed)\n"
+        "==========================================================\n"
+        f"{_build_word_table(siblings)}\n\n"
+        "Identify the subject from the event title above. Search for the "
+        "subject's recent public appearances and apply the system-prompt "
+        "rules. Return JSON only."
     )
 
+
+def _executable_pct(market: dict, side: str) -> int:
+    """Probability the executable side of the trade implies."""
+    if side == "YES":
+        return int(market.get("yes_ask") or market.get("last_price") or 0)
+    bid = int(market.get("yes_bid") or market.get("last_price") or 0)
+    return 100 - bid
+
+
+def _last_pct(market: dict) -> int:
+    return int(market.get("last_price") or 0)
+
+
+def _spread(market: dict) -> int:
+    bid = int(market.get("yes_bid") or 0)
+    ask = int(market.get("yes_ask") or 0)
+    return max(0, ask - bid)
+
+
+def post_filter_edges(edges: list[dict], siblings: list[dict]) -> list[dict]:
+    """Server-side enforcement of the same rules the prompt states.
+
+    The LLM is asked to gate on edge >= 10pp vs executable side AND
+    confidence >= 70. We re-check here so a sloppy or fabricating model
+    can't sneak a weak bet through. Each surviving edge is decorated with
+    last_pct, executable_pct, spread, edge_pp, and the linked sibling
+    market dict so the renderer has everything it needs.
+    """
+    by_ticker = {m["ticker"]: m for m in siblings}
+    out: list[dict] = []
+    for e in edges:
+        m = by_ticker.get(e.get("ticker"))
+        if m is None:
+            continue
+        side = e.get("side")
+        if side not in ("YES", "NO"):
+            continue
+        try:
+            model_yes = int(e.get("model_pct"))
+            conf = int(e.get("confidence_pct"))
+        except (TypeError, ValueError):
+            continue
+        if conf < CONFIDENCE_THRESHOLD:
+            continue
+        last = _last_pct(m)
+        execp = _executable_pct(m, side)
+        # model probability for the SIDE we're betting
+        model_side = model_yes if side == "YES" else 100 - model_yes
+        edge_pp = abs(model_side - execp)
+        if edge_pp < EDGE_THRESHOLD_PP:
+            continue
+        e2 = dict(e)
+        e2["market"] = m
+        e2["last_pct"] = last
+        e2["executable_pct"] = execp
+        e2["spread"] = _spread(m)
+        e2["edge_pp"] = edge_pp
+        e2["model_pct_side"] = model_side
+        out.append(e2)
+    out.sort(key=lambda x: -x["edge_pp"])
+    return out[:MAX_EDGES_PER_EVENT]
+
+
+def analyze_event(
+    event: dict,
+    siblings: list[dict],
+    api_key: str,
+    *,
+    timeout: int = 120,
+) -> Optional[dict]:
+    """Run one Perplexity call for the whole event. Returns
+    {event_brief, edges (post-filtered + decorated), _cost_usd, _model}
+    or None on hard failure."""
     body = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": _build_user_prompt(event, siblings)},
         ],
         "temperature": 0.1,
         "response_format": {
@@ -197,10 +303,19 @@ def analyze(market: dict, api_key: str, timeout: int = 60) -> Optional[dict]:
         payload = r.json()
         content = payload["choices"][0]["message"]["content"]
         result = json.loads(content)
-        usage = payload.get("usage") or {}
-        cost = ((usage.get("cost") or {}).get("total_cost")) or 0.0
-        result["_cost_usd"] = float(cost)
-        return result
     except Exception as e:
-        print(f"  ! perplexity error for {market.get('ticker')}: {e}")
+        print(f"  ! perplexity error for {event.get('event_ticker')}: {e}")
         return None
+
+    raw_edges = result.get("edges") or []
+    filtered = post_filter_edges(raw_edges, siblings)
+
+    usage = payload.get("usage") or {}
+    cost = ((usage.get("cost") or {}).get("total_cost")) or 0.0
+    return {
+        "event_brief": (result.get("event_brief") or "").strip(),
+        "edges": filtered,
+        "raw_edge_count": len(raw_edges),
+        "_cost_usd": float(cost),
+        "_model": payload.get("model") or MODEL,
+    }
